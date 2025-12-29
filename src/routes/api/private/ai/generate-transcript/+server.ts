@@ -31,12 +31,8 @@ export async function POST({ locals, request }: RequestEvent) {
 
 
     try {
-        console.log("1")
         const formData = await request.formData();
         const audioFile = formData.get('audio');
-    
-        console.log("2")
-
 
         if (!audioFile) {
             return json(
@@ -44,8 +40,6 @@ export async function POST({ locals, request }: RequestEvent) {
                 { status: 400 }
             );
         }
-        
-        console.log("3")
 
         if (typeof audioFile === 'string') {
             return json(
@@ -54,9 +48,6 @@ export async function POST({ locals, request }: RequestEvent) {
             );
         }
 
-        console.log("4")
-
-
         if (!(audioFile instanceof File)) {
             return json(
                 { success: false, error: 'Invalid file type' },
@@ -64,9 +55,6 @@ export async function POST({ locals, request }: RequestEvent) {
             );
         }
     
-
-        console.log("5")
-
         // Now audioFile is definitely a File
         const validationResult = GenerateTranscriptSchema.safeParse({ audio: audioFile });
     
@@ -77,28 +65,18 @@ export async function POST({ locals, request }: RequestEvent) {
                 { status: 400 }
             );
         }
-
-        console.log("6")
-
     
         const { audio } = validationResult.data;
     
         const audioBuffer = Buffer.from(await audio.arrayBuffer());
 
-
-        console.log("7")
-
         // (OpenAI file uploads for transcriptions are currently limited to 25 MB)
-        console.log("audioBuffer.byteLength:", audioBuffer.byteLength)
         if (audioBuffer.byteLength > 25 * 1024 * 1024) {
             return json(
                 { success: false, error: 'File too large for transcription (max 25 MB)' },
                 { status: 400 }
             );
         } // :contentReference[oaicite:1]{index=1}
-
-
-        console.log("8")
 
 
         // Write to a temp file so we can pass fs.createReadStream() to the SDK
@@ -109,7 +87,6 @@ export async function POST({ locals, request }: RequestEvent) {
         try {
             await writeFile(tmpPath, audioBuffer);
 
-            console.log("about to transcribe")
             const transcription = await openai.audio.transcriptions.create({
                 model: 'whisper-1',
                 file: fs.createReadStream(tmpPath),
@@ -119,11 +96,6 @@ export async function POST({ locals, request }: RequestEvent) {
                 // language: 'en',
                 // response_format: 'json' // default; whisper-1 also supports 'text', 'srt', 'vtt', 'verbose_json'
             });
-
-            console.log('transcription:', transcription)
-
-            console.log("after transcribe")
-
 
             // transcription.text is the transcript string for the json response format
             return json({

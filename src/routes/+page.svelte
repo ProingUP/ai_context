@@ -1,6 +1,8 @@
 <script lang='ts'>
-	import { createMediaPrompts, generateImage, generateLogicalChunks, generateTranscript, type EnrichedLogicalChunk, type LogicalChunk } from "$lib/api/ai";
+	import ContextBubble from "$components/ContextBubble.svelte";
+import { createMediaPrompts, generateContextDetails, generateContextMoments, generateImage, generateLogicalChunksForImageContext, generateTranscript, type ContextMoment, type EnrichedContextMoment, type EnrichedContextMomentWithImages, type EnrichedLogicalChunk, type LogicalChunk, type TextContextItem, type TimelinePoint, type TranscriptSegment } from "$lib/api/ai";
 	import Loading from "$src/constants/loading/Loading.svelte";
+	import { onDestroy, tick } from "svelte";
 
     type EnrichedChunkWithImage = EnrichedLogicalChunk & {
         imageUrl?: string | null;
@@ -107,14 +109,46 @@
     let uploadedFile: File | null = $state(null);
     let files: FileList | null = $state(null); // Add this for binding to the input
 
+    async function getAudioFileForTranscription(original: File): Promise<File> {
+        // For now, always send to worker.
+        // Worker will pass-through audio and extract if video.
+        const fd = new FormData();
+        fd.append("file", original);
+
+        const res = await fetch("http://localhost:7777/extract-audio", {
+            method: "POST",
+            body: fd
+        });
+
+        if (!res.ok) {
+            const text = await res.text();
+            throw new Error(`Local media worker error (${res.status}): ${text}`);
+        }
+
+        const audioBlob = await res.blob();
+
+        // Keep a stable filename for your downstream pipeline.
+        // (You can get fancy later by reading Content-Disposition.)
+        const audioFile = new File([audioBlob], "audio.mp3", {
+            type: audioBlob.type || "audio/mpeg"
+        });
+
+        return audioFile;
+    }
+
     let transcribingAudio = $state(false);
     let transcriptText = $state('');
+    let transcriptWords = $state<any[]>([]);
+    let transcriptionSegments = $state<any[]>([]);
     async function transcribeAudio(file: File): Promise<string | void> {
         if (transcribingAudio) return;
         transcribingAudio = true;
 
         try {    
-            const response = await generateTranscript(file);
+
+            const audioFile = await getAudioFileForTranscription(file);
+            console.log("audioFile:", audioFile)
+            const response = await generateTranscript(audioFile);
     
             if (!response.success) {
                 throw new Error('Transcription failed');
@@ -122,8 +156,12 @@
 
             const data = response.data;
             transcriptText = data.text;
-            const transcriptWords = data.words;
-            const transcriptionSegments = data.segments;
+            console.log('transcriptText:', transcriptText);
+            transcriptWords = data.words;
+            console.log('transcriptWords:', transcriptWords);
+            transcriptionSegments = data.segments;
+            console.log('transcriptionSegments:', transcriptionSegments);
+            
 
             // console.log("transcriptText: ", transcriptText)
             // console.log("transcriptWords: ", transcriptWords)
@@ -138,12 +176,12 @@
 
     let generatingLogicalChunks = $state(false);
     let generatedTextChunks = $state<LogicalChunk[]>([]);
-    async function handleGenerateLogicalChunks(transcriptText: string): Promise<void> {
-        if (generatingLogicalChunks || !transcriptText) return;
+    async function handleGenerateLogicalChunks(transcript: string): Promise<void> {
+        if (generatingLogicalChunks || !transcript) return;
 
         generatingLogicalChunks = true;
         try {
-            const response = await generateLogicalChunks(transcriptText);
+            const response = await generateLogicalChunksForImageContext(transcript);
     
             if (!response.success) {
                 throw new Error('Transcription failed');
@@ -159,6 +197,33 @@
         } catch (error) {
             generatingLogicalChunks = false;
             console.error('Error generating logical chunks:', error);
+        }
+    }
+
+    let generatingContextMoments = $state(false);
+    let contextMoments = $state<ContextMoment[]>([]);
+    async function handleGenerateContextMoments(transcript: string): Promise<void> {
+        if (generatingContextMoments) return;
+        generatingContextMoments = true;
+
+        try {
+            // Call your context moments generation API here
+            const response = await generateContextMoments(transcript);
+
+            if (!response.success) {
+                throw new Error('Context moments generation failed');
+            }
+        
+            const data = response.data;
+
+            console.log('data.contextMoments', data.moments);
+
+            contextMoments = data.moments;
+
+            generatingContextMoments = false;
+        } catch (error) {
+            generatingContextMoments = false;
+            console.error('Error generating context moments:', error);
         }
     }
 
@@ -214,6 +279,36 @@
         }
     }
 
+    let generatingContextDetails = $state(false);
+    let enrichedContextMoments = $state<OrderedMoment[]>([]);
+    async function handleGenerateContextDetails(
+        moments: ContextMoment[],
+        transcriptText?: string
+    ): Promise<void> {
+        if (generatingContextDetails) return;
+        if (!moments || moments.length === 0) return;
+
+        generatingContextDetails = true;
+
+        try {
+            const response = await generateContextDetails(moments, transcriptText);
+
+            if (!response.success) {
+                throw new Error(response.error || 'Context details generation failed');
+            }
+
+            const data = response.data;
+            console.log('data.enrichedContextMoments', data.moments);
+
+            enrichedContextMoments = data.moments ?? [];
+            generatingContextDetails = false;
+        } catch (error) {
+            generatingContextDetails = false;
+            console.error('Error generating context details:', error);
+        }
+    }
+
+
     let handlingEntireFlow = $state(false);
     async function handleEntireFlow(uploadedFile: File | null = null): Promise<void> {
         if (handlingEntireFlow || !uploadedFile) return;
@@ -229,37 +324,59 @@
             // enrichedChunks = FINAL_ENRICHED_LOGICAL_CHUNKS;
 
             await transcribeAudio(uploadedFile);
-            await handleGenerateLogicalChunks(transcriptText);
-            await handleCreateMediaPrompt(generatedTextChunks);
+            await handleGenerateContextMoments(transcriptText);
+            await handleGenerateContextDetails(contextMoments, transcriptText);
+            
+            // NEW: order them by where the triggerQuote appears in the transcript
+            enrichedContextMoments = orderEnrichedMomentsByTranscript(
+                enrichedContextMoments,
+                transcriptWords,
+                { skipNotFound: true } // or false if you want unmatched at the end
+            );
 
-            if (enrichedChunks && enrichedChunks.length > 0) {
-                for (const chunk of enrichedChunks) {
-                    if (!chunk.prompt) continue;
+            await tick();
 
-                    // mark as generating (reactive)
-                    enrichedChunks = enrichedChunks.map((c) =>
-                        c.chunkIndex === chunk.chunkIndex
-                            ? { ...c, imageStatus: 'generating', imageError: null }
-                            : c
-                    );
+            contextTimeline = createContextTimeline(enrichedContextMoments, transcriptWords, {
+                durationSec: 14,
+                gapSec: 0.5
+            });
+            console.log("contextTimeline: ", contextTimeline)
 
-                    const imageData = await handleGenerateImage(chunk.prompt);
+            // await sendTimelineToServer(uploadedFile, contextTimeline);
 
-                    if (imageData?.url) {
-                        enrichedChunks = enrichedChunks.map((c) =>
-                            c.chunkIndex === chunk.chunkIndex
-                            ? { ...c, imageUrl: imageData.url, imageStatus: 'done' }
-                            : c
-                        );
-                    } else {
-                        enrichedChunks = enrichedChunks.map((c) =>
-                            c.chunkIndex === chunk.chunkIndex
-                            ? { ...c, imageStatus: 'error', imageError: 'No image returned' }
-                            : c
-                        );
-                    }
-                }
-            }
+
+            // await handleGenerateLogicalChunks(transcriptText);
+            
+            // await handleCreateMediaPrompt(generatedTextChunks);
+
+            // if (enrichedChunks && enrichedChunks.length > 0) {
+            //     for (const chunk of enrichedChunks) {
+            //         if (!chunk.prompt) continue;
+
+            //         // mark as generating (reactive)
+            //         enrichedChunks = enrichedChunks.map((c) =>
+            //             c.chunkIndex === chunk.chunkIndex
+            //                 ? { ...c, imageStatus: 'generating', imageError: null }
+            //                 : c
+            //         );
+
+            //         const imageData = await handleGenerateImage(chunk.prompt);
+
+            //         if (imageData?.url) {
+            //             enrichedChunks = enrichedChunks.map((c) =>
+            //                 c.chunkIndex === chunk.chunkIndex
+            //                 ? { ...c, imageUrl: imageData.url, imageStatus: 'done' }
+            //                 : c
+            //             );
+            //         } else {
+            //             enrichedChunks = enrichedChunks.map((c) =>
+            //                 c.chunkIndex === chunk.chunkIndex
+            //                 ? { ...c, imageStatus: 'error', imageError: 'No image returned' }
+            //                 : c
+            //             );
+            //         }
+            //     }
+            // }
 
             handlingEntireFlow = false;
         } else {
@@ -268,21 +385,609 @@
         }
     }
 
+    let previewUrl: string | null = $state(null);
+    let previewKind: "video" | "audio" | "unknown" = $state("unknown");
+
+    function isProbablyVideo(file: File) {
+        // Good enough for preview purposes (don’t use for security decisions)
+        if (file.type?.startsWith("video/")) return true;
+        const ext = file.name.split(".").pop()?.toLowerCase();
+        return ext === "mp4" || ext === "mov" || ext === "webm" || ext === "mkv";
+    }
+
+    function isProbablyAudio(file: File) {
+        if (file.type?.startsWith("audio/")) return true;
+        const ext = file.name.split(".").pop()?.toLowerCase();
+        return ext === "mp3" || ext === "m4a" || ext === "wav" || ext === "ogg";
+    }
+
+    function setPreviewForFile(file: File | null) {
+        // cleanup old preview URL
+        if (previewUrl) URL.revokeObjectURL(previewUrl);
+        previewUrl = null;
+        previewKind = "unknown";
+
+        if (!file) return;
+
+        previewUrl = URL.createObjectURL(file);
+        if (isProbablyVideo(file)) previewKind = "video";
+        else if (isProbablyAudio(file)) previewKind = "audio";
+        else previewKind = "unknown";
+    }
+
+    onDestroy(() => {
+        if (previewUrl) URL.revokeObjectURL(previewUrl);
+    });
+
+    function formatImageCredit(img: any): string {
+        const bits: string[] = [];
+        if (img.source) bits.push(img.source);
+        if (img.author) bits.push(`Author: ${img.author}`);
+        if (img.licenseShort) bits.push(`License: ${img.licenseShort}`);
+        return bits.join(' • ');
+    }
+
+    // Helpers for matching triggerQuote inside a segment
+    function normalizeForSearch(s: string): string {
+        return (s ?? '')
+            .toLowerCase()
+            .replace(/\s+/g, ' ')
+            .replace(/[“”‘’]/g, "'")
+            .replace(/[^a-z0-9' ]/g, '') // drop punctuation
+            .trim();
+    }
+
+    function includesNormalized(haystack: string, needle: string): boolean {
+        const h = normalizeForSearch(haystack);
+        const n = normalizeForSearch(needle);
+        if (!h || !n) return false;
+        return h.includes(n);
+    }
+
+    function getSegStart(seg: TranscriptSegment): number | null {
+        const v = seg.start ?? seg.segmentStart;
+        return typeof v === 'number' && Number.isFinite(v) ? v : null;
+    }
+
+    // FOR ORDERING ENRICHED MOMENTS TO MATCH TRANSCRIPT FLOW
+    type TranscriptIndex = {
+        flatTokens: string[];
+        tokenToWordIndex: number[]; // flatTokens[i] came from transcriptWords[tokenToWordIndex[i]]
+    };
+
+    function buildTranscriptIndex(transcriptWords: TranscriptWord[]): TranscriptIndex {
+        const flatTokens: string[] = [];
+        const tokenToWordIndex: number[] = [];
+
+        for (let wi = 0; wi < transcriptWords.length; wi++) {
+            const raw = getWordText(transcriptWords[wi]);
+            const toks = normalizeTranscriptWordToTokens(raw); // you already have this
+            for (const t of toks) {
+                flatTokens.push(t);
+                tokenToWordIndex.push(wi);
+            }
+        }
+
+        return { flatTokens, tokenToWordIndex };
+    }
+
+    function findQuoteInIndex(
+        idx: TranscriptIndex,
+        transcriptWords: TranscriptWord[],
+        quoteTokens: string[],
+        startFromWordIndex: number
+    ): { matchWordIndex: number; t_start: number } | null {
+        if (!quoteTokens.length) return null;
+        if (!idx.flatTokens.length) return null;
+
+        // Convert word cursor -> token cursor
+        let tokenCursor = 0;
+        if (startFromWordIndex > 0) {
+            tokenCursor = idx.tokenToWordIndex.findIndex((wi) => wi >= startFromWordIndex);
+            if (tokenCursor < 0) tokenCursor = idx.flatTokens.length;
+        }
+
+        const first = quoteTokens[0];
+
+        for (let ti = tokenCursor; ti < idx.flatTokens.length; ti++) {
+            if (idx.flatTokens[ti] !== first) continue;
+
+            let ok = true;
+            for (let j = 1; j < quoteTokens.length; j++) {
+            const k = ti + j;
+            if (k >= idx.flatTokens.length || idx.flatTokens[k] !== quoteTokens[j]) {
+                ok = false;
+                break;
+            }
+            }
+            if (!ok) continue;
+
+            const matchWordIndex = idx.tokenToWordIndex[ti];
+            const t0 = getWordStartTime(transcriptWords[matchWordIndex]);
+            if (t0 == null) return null;
+
+            return { matchWordIndex, t_start: t0 };
+        }
+
+        return null;
+    }
+
+    type OrderedMoment = EnrichedContextMomentWithImages & {
+        startWordIndex: number; // for ordering
+        matchFound: boolean;
+        matchTimeStart: number | null; // optional debug/use
+    };
+
+    /**
+     * Compute start word index for each moment and return them ordered by transcript position.
+     */
+    function orderEnrichedMomentsByTranscript(
+        enrichedMoments: EnrichedContextMomentWithImages[],
+        transcriptWords: TranscriptWord[],
+        opts?: {
+            skipNotFound?: boolean; // default false
+        }
+    ): OrderedMoment[] {
+        const skipNotFound = opts?.skipNotFound ?? false;
+
+        if (!enrichedMoments?.length || !transcriptWords?.length) return [];
+
+        const index = buildTranscriptIndex(transcriptWords);
+
+        const located = enrichedMoments.map((m, origIndex) => {
+            const quoteRaw = (m.triggerQuote ?? "").trim();
+            const quoteTokens = tokenizeQuote(quoteRaw);
+
+            if (!quoteTokens.length) {
+                return {
+                    ...m,
+                    startWordIndex: Number.POSITIVE_INFINITY,
+                    matchFound: false,
+                    matchTimeStart: null,
+                    __origIndex: origIndex
+                } as any;
+            }
+
+            // IMPORTANT: for ordering, search from the beginning (word 0)
+            const found = findQuoteInIndex(index, transcriptWords, quoteTokens, 0);
+
+            if (!found) {
+                return {
+                        ...m,
+                        startWordIndex: Number.POSITIVE_INFINITY,
+                        matchFound: false,
+                        matchTimeStart: null,
+                        __origIndex: origIndex
+                    } as any;
+            }
+
+            return {
+                ...m,
+                startWordIndex: found.matchWordIndex,
+                matchFound: true,
+                matchTimeStart: found.t_start,
+                __origIndex: origIndex
+            } as any;
+        });
+
+        let filtered = located;
+        if (skipNotFound) filtered = located.filter((m) => m.matchFound);
+
+        // Stable sort: by startWordIndex then original array order
+        filtered.sort((a: any, b: any) => {
+            const da = a.startWordIndex;
+            const db = b.startWordIndex;
+            if (da !== db) return da - db;
+            return a.__origIndex - b.__origIndex;
+        });
+
+        // Strip helper
+        return filtered.map(({ __origIndex, ...rest }: any) => rest);
+        }
+
+
+    // TRANSCRIPT WORDS HELPER FUNCTIONS FOR TIMELINE
+    type TranscriptWord = {
+        word?: string;      // whisper often uses "word"
+        text?: string;      // sometimes "text"
+        start?: number;     // seconds
+        end?: number;       // seconds
+        startTime?: number; // alt
+        endTime?: number;   // alt
+        };
+
+    // Keep apostrophes, strip everything else punctuation-wise.
+    function normalizeTokenKeepApostrophes(raw: string): string {
+        return (raw ?? "")
+            .toLowerCase()
+            .replace(/[“”]/g, '"')
+            .replace(/[‘’]/g, "'")
+            .replace(/[^a-z0-9'\s]/g, " ")  // drop punctuation but KEEP apostrophes
+            .replace(/\s+/g, " ")
+            .trim();
+    }
+
+    function tokenizeQuote(quote: string): string[] {
+        if (!quote) return [];
+
+        // 1) Normalize unicode dashes to a simple hyphen, then turn hyphens into spaces
+        // so "test-time" becomes "test time"
+        const dashNormalized = quote
+            .replace(/[‐-‒–—―]/g, "-") // all common dash chars -> "-"
+            .replace(/-/g, " ");      // hyphen -> space
+
+        // 2) Your existing normalization (keeps apostrophes)
+        const cleaned = normalizeTokenKeepApostrophes(dashNormalized);
+        if (!cleaned) return [];
+
+        return cleaned.split(" ").filter(Boolean);
+    }
+
+    function normalizeTranscriptWordToTokens(raw: string): string[] {
+        const dashNormalized = (raw ?? "")
+            .replace(/[‐-‒–—―]/g, "-")
+            .replace(/-/g, " ");
+
+        const cleaned = normalizeTokenKeepApostrophes(dashNormalized);
+        if (!cleaned) return [];
+        return cleaned.split(" ").filter(Boolean);
+    }
+
+
+    function getWordText(w: TranscriptWord): string {
+        // robust across different formats
+        return (w.word ?? w.text ?? "").toString();
+    }
+
+    function getWordStartTime(w: TranscriptWord): number | null {
+        const v =
+            w.start ??
+            w.startTime ??
+            // sometimes timestamps are nested or stringy; be defensive
+            (typeof (w as any).timestamp === "number" ? (w as any).timestamp : undefined);
+
+        return typeof v === "number" && Number.isFinite(v) ? v : null;
+    }
+    
+    function findQuoteInWords(
+        transcriptWords: TranscriptWord[],
+        quoteTokens: string[],
+        startFromIndex: number
+    ): { matchIndex: number; t_start: number; nextCursor: number } | null {
+        if (!quoteTokens.length) return null;
+        if (!transcriptWords?.length) return null;
+
+        // Flatten transcript into tokens, but keep mapping back to the original word index
+        const flatTokens: string[] = [];
+        const tokenToWordIndex: number[] = [];
+
+        for (let wi = 0; wi < transcriptWords.length; wi++) {
+            const raw = getWordText(transcriptWords[wi]);
+            const toks = normalizeTranscriptWordToTokens(raw);
+            for (const t of toks) {
+                flatTokens.push(t);
+                tokenToWordIndex.push(wi);
+            }
+        }
+
+        // Convert "wordCursor" (word index) into a token cursor
+        let tokenCursor = 0;
+        if (startFromIndex > 0) {
+            // find first token whose mapped word index >= startFromIndex
+            tokenCursor = tokenToWordIndex.findIndex((wi) => wi >= startFromIndex);
+            if (tokenCursor < 0) tokenCursor = flatTokens.length;
+        }
+
+        const first = quoteTokens[0];
+
+        for (let ti = Math.max(0, tokenCursor); ti < flatTokens.length; ti++) {
+            if (flatTokens[ti] !== first) continue;
+
+            let ok = true;
+            for (let j = 1; j < quoteTokens.length; j++) {
+                const idx = ti + j;
+                if (idx >= flatTokens.length || flatTokens[idx] !== quoteTokens[j]) {
+                    ok = false;
+                    break;
+                }
+            }
+            if (!ok) continue;
+
+            // Timestamp should come from the FIRST underlying transcript "word" that contributed tokens
+            const matchedWordIndex = tokenToWordIndex[ti];
+            const t0 = getWordStartTime(transcriptWords[matchedWordIndex]);
+            if (t0 == null) return null;
+
+            // next cursor should advance past the last matched token's underlying word index
+            const lastMatchedWordIndex = tokenToWordIndex[ti + quoteTokens.length - 1];
+            const nextCursor = lastMatchedWordIndex + 1;
+
+            return {
+                matchIndex: matchedWordIndex,
+                t_start: t0,
+                nextCursor
+            };
+        }
+
+        return null;
+    }
+
+
+
+
+
+    type TimelinePoint = {
+        momentIndex: number;
+        segmentIndex: number;
+        triggerQuote: string;
+        title: string;
+        importance: number;
+        visual: any;
+        visualQuery: string | null;
+        context: string;
+
+        t_start: number;
+        t_end: number;
+    };    
+    let creatingContextTimeline = $state(false);
+    let contextTimeline = $state<any>(null);
+    function createContextTimeline(
+        enrichedMoments: EnrichedContextMomentWithImages[],
+        transcriptWords: TranscriptWord[],
+        opts?: {
+            durationSec?: number; // bubble length (default 10)
+            gapSec?: number;      // minimum gap when bumping (default 0.5)
+            allowSkipIfNotFound?: boolean; // default true
+        }
+    ): TimelinePoint[] {
+        const durationSec = opts?.durationSec ?? 10;
+        const gapSec = opts?.gapSec ?? 0.5;
+        const allowSkipIfNotFound = opts?.allowSkipIfNotFound ?? true;
+
+        console.log("inside createContextTimeline - enrichedMoments:", enrichedMoments);
+        console.log("inside createContextTimeline - transcriptWords:", transcriptWords);
+
+        if (!enrichedMoments?.length || !transcriptWords?.length) return [];
+
+        const timeline: TimelinePoint[] = [];
+        let wordCursor = 0;
+
+        for (let mi = 0; mi < enrichedMoments.length; mi++) {
+            const m = enrichedMoments[mi];
+            const quoteRaw = (m.triggerQuote ?? "").trim();
+            if (!quoteRaw) continue;
+
+            const quoteTokens = tokenizeQuote(quoteRaw);
+            if (!quoteTokens.length) continue;
+
+            const startFrom = (m as any).startWordIndex ?? wordCursor;
+            const found = findQuoteInWords(transcriptWords, quoteTokens, startFrom);
+
+            if (!found) {
+            console.log("No word-level match for:", quoteRaw);
+            if (allowSkipIfNotFound) continue;
+
+            // Forced fallback: place it after previous bubble end (or 0)
+            const fallbackStart = timeline.at(-1)?.t_end ?? 0;
+            let t_start = fallbackStart;
+            let t_end = t_start + durationSec;
+
+            const prev = timeline.at(-1);
+            if (prev && t_start < prev.t_end) {
+                t_start = prev.t_end + gapSec;
+                t_end = t_start + durationSec;
+            }
+
+            timeline.push({
+                momentIndex: mi,
+                segmentIndex: -1, // not segment-based anymore
+                triggerQuote: m.triggerQuote,
+                title: m.title,
+                importance: m.importance,
+                visual: m.visual,
+                visualQuery: m.visualQuery ?? null,
+                context: m.context,
+                t_start,
+                t_end
+            });
+
+            continue;
+            }
+
+            // Advance cursor so later matches occur after earlier ones
+            wordCursor = found.nextCursor;
+
+            // 2) Compute window
+            let t_start = found.t_start;
+            let t_end = t_start + durationSec;
+
+            // 3) Avoid overlap
+            const prev = timeline.at(-1);
+            if (prev && t_start < prev.t_end) {
+            t_start = prev.t_end + gapSec;
+            t_end = t_start + durationSec;
+            }
+
+            timeline.push({
+            momentIndex: mi,
+            segmentIndex: -1, // we’re word-indexing now
+            triggerQuote: m.triggerQuote,
+            title: m.title,
+            importance: m.importance,
+            visual: m.visual,
+            visualQuery: m.visualQuery ?? null,
+            context: m.context,
+            t_start,
+            t_end
+            });
+        }
+
+        return timeline;
+    }
+
+    let processingVideo = $state(false);
+    let processingVideoError = $state<string | null>(null);
+
+    // If your server returns a processed video blob:
+    let processedVideoUrl = $state<string | null>(null);
+
+    // If your server returns a JSON with { url: "..." }:
+    let processedVideoRemoteUrl = $state<string | null>(null);
+
+    onDestroy(() => {
+        if (previewUrl) URL.revokeObjectURL(previewUrl);
+        if (processedVideoUrl) URL.revokeObjectURL(processedVideoUrl);
+    });
+    
+    async function sendTimelineToServer(
+        originalFile: File,
+        timeline: TimelinePoint[]
+    ): Promise<void> {
+        if (!originalFile) throw new Error("Missing video/audio file");
+        if (!timeline?.length) throw new Error("Timeline is empty");
+
+        processingVideo = true;
+        processingVideoError = null;
+
+        // clear previous output
+        if (processedVideoUrl) {
+            URL.revokeObjectURL(processedVideoUrl);
+            processedVideoUrl = null;
+        }
+        processedVideoRemoteUrl = null;
+
+        try {
+            const fd = new FormData();
+
+            // Send original file (video or audio)
+            fd.append("file", originalFile);
+
+            // Send timeline as JSON text
+            fd.append("timeline", JSON.stringify(timeline));
+
+            // Optional: include settings your ffmpeg pipeline might want
+            // fd.append("opts", JSON.stringify({ fontSize: 28, bubbleWidth: 800 }));
+
+            const res = await fetch("http://localhost:7777/render-context-bubbles", {
+                method: "POST",
+                body: fd
+            });
+
+            if (!res.ok) {
+                const txt = await res.text().catch(() => "");
+                throw new Error(`Server error (${res.status}): ${txt || "unknown error"}`);
+            }
+
+            // ---- Choose ONE of these patterns depending on what your server returns ----
+
+            // Pattern A) Server returns a VIDEO FILE (recommended for localhost dev)
+            const contentType = res.headers.get("content-type") || "";
+            if (contentType.includes("video/") || contentType.includes("application/octet-stream")) {
+                const blob = await res.blob();
+                processedVideoUrl = URL.createObjectURL(blob);
+                return;
+            }
+
+            // Pattern B) Server returns JSON like { url: "http://..." }
+            const data = await res.json();
+            if (data?.url) {
+                processedVideoRemoteUrl = data.url;
+                return;
+            }
+
+            throw new Error("Server response did not include a video blob or a url");
+        } catch (err: any) {
+            processingVideoError = err?.message ?? "Failed to process video";
+            console.error("sendTimelineToServer error:", err);
+        } finally {
+            processingVideo = false;
+        }
+    }
+
+
+    // --- Video overlay preview state ---
+    let videoEl: HTMLVideoElement | null = $state(null);
+    let currentTimeSec = $state(0);
+
+    // which boxes should be visible right now
+    let activeTimelinePoints = $state<TimelinePoint[]>([]);
+    // optional: for smooth showing/hiding
+    const OVERLAY_FADE_MS = 180;
+
+    // fast lookup helper
+    function computeActivePoints(t: number, timeline: TimelinePoint[]): TimelinePoint[] {
+        if (!timeline?.length) return [];
+        // show any timeline point whose window contains current time
+        return timeline.filter((p) => t >= p.t_start && t <= p.t_end);
+    }
+
+    // called on time updates / seeking
+    function syncActiveBoxes() {
+        if (!videoEl) return;
+        currentTimeSec = videoEl.currentTime ?? 0;
+        activeTimelinePoints = computeActivePoints(currentTimeSec, contextTimeline ?? []);
+    }
+
+
 
 </script>
 
 <div class=''>
-    <h1 class='font-bold text-2xl'>Podcast Visualizer</h1>
+    <h1 class='font-bold text-2xl'>Podcast Context / Visualizer</h1>
 </div>
 
 <div>
     <input
         type="file"
         bind:files
-        accept=".mp3,.m4a,.wav,.ogg, .mp4"
+        accept=".mp3,.m4a,.wav,.ogg,.mp4,.mov,.webm"
         class='border rounded p-2 mt-4'
+        onchange={() => setPreviewForFile(files?.[0] ?? null)}
     />
 </div>
+
+{#if previewUrl && previewKind === "video"}
+    <div class="mt-4">
+        <div class="text-sm font-semibold opacity-80 mb-2">Video preview</div>
+
+        <div class="relative w-full max-w-5xl mx-auto">
+        <video
+            bind:this={videoEl}
+            class="w-full rounded border"
+            src={previewUrl}
+            controls
+            playsinline
+            preload="metadata"
+            ontimeupdate={syncActiveBoxes}
+            onseeked={syncActiveBoxes}
+            onloadedmetadata={syncActiveBoxes}
+            onplay={syncActiveBoxes}
+        />
+
+        <!-- Overlay layer -->
+        {#if activeTimelinePoints && activeTimelinePoints.length > 0}
+            <div class="pointer-events-none absolute inset-0">
+            <div class="absolute left-0 right-0 bottom-10 px-4">
+                {#each activeTimelinePoints as p (p.momentIndex + '|' + p.t_start)}
+                    <ContextBubble {p} />
+                {/each}
+            </div>
+            </div>
+        {/if}
+        </div>
+
+        {#if contextTimeline?.length}
+        <div class="mt-2 text-xs opacity-70">
+            t = {currentTimeSec.toFixed(2)}s • active: {activeTimelinePoints.length}
+        </div>
+        {/if}
+    </div>
+{:else if previewUrl && previewKind === "audio"}
+    <div class="mt-4">
+        <div class="text-sm font-semibold opacity-80 mb-2">Audio preview</div>
+        <audio class="w-full max-w-2xl" src={previewUrl} controls preload="metadata" />
+    </div>
+{/if}
 
 <!-- Button -->
 <div class='flex flex-col'>
@@ -321,7 +1026,201 @@
         {/if}
     {/if}
 
-    {#if generatingLogicalChunks}
+    <!-- Context Moments -->
+    {#if generatingContextMoments}
+        <div class="mt-6">
+            <Loading />
+            <div>
+                <span>Finding context moments...</span>
+            </div>
+        </div>
+    {:else if contextMoments && contextMoments.length > 0}
+        <div class="mt-6">
+            <h2 class="font-bold text-xl mt-4">Context Moments (candidates)</h2>
+
+            {#each contextMoments as m, index}
+                <div class="border p-3 my-3 rounded">
+                <div class="flex items-center justify-between">
+                    <h3 class="font-semibold">Moment {index + 1}</h3>
+
+                    <div class="text-xs opacity-70 flex items-center gap-2">
+                    <span class="px-2 py-0.5 border rounded">
+                        {m.importance}
+                    </span>
+
+                    {#if m.segmentStart != null || m.segmentEnd != null}
+                        <span>
+                        Segments: {m.segmentStart ?? '—'}–{m.segmentEnd ?? '—'}
+                        </span>
+                    {/if}
+                    </div>
+                </div>
+
+                <div class="mt-2">
+                    <div class="text-sm font-semibold opacity-80">Title</div>
+                    <div>{m.title}</div>
+                </div>
+
+                <div class="mt-2">
+                    <div class="text-sm font-semibold opacity-80">Trigger Quote</div>
+                    <p class="whitespace-pre-wrap">"{m.triggerQuote}"</p>
+                </div>
+                </div>
+            {/each}
+        </div>
+    {/if}
+
+    <!-- Enriched Context Details -->
+    {#if generatingContextDetails}
+        <div class="mt-6">
+            <Loading />
+            <div>
+                <span>Generating context explanations...</span>
+            </div>
+        </div>
+    {:else if enrichedContextMoments && enrichedContextMoments.length > 0}
+        <div class="mt-6">
+            <h2 class="font-bold text-xl mt-4">Context Details (enriched)</h2>
+
+            {#each enrichedContextMoments as m, index}
+                <div class="border p-3 my-3 rounded">
+                    <div class="flex items-center justify-between">
+                        <h3 class="font-semibold">Context {index + 1}</h3>
+
+                        <div class="text-xs opacity-70 flex items-center gap-2">
+                        <span class="px-2 py-0.5 border rounded">
+                            {m.importance}
+                        </span>
+
+                        {#if m.segmentStart != null || m.segmentEnd != null}
+                            <span>
+                            Segments: {m.segmentStart ?? '—'}–{m.segmentEnd ?? '—'}
+                            </span>
+                        {/if}
+                        </div>
+                    </div>
+
+                    <div class="mt-2">
+                        <div class="text-sm font-semibold opacity-80">Title</div>
+                        <div>{m.title}</div>
+                    </div>
+
+                    <div class="mt-2">
+                        <div class="text-sm font-semibold opacity-80">Trigger Quote</div>
+                        <p class="whitespace-pre-wrap">"{m.triggerQuote}"</p>
+                    </div>
+
+                    <!-- <div class="mt-3 border-t pt-3">
+                        <div class="text-sm font-semibold opacity-80">Explanation</div>
+                        <p class="whitespace-pre-wrap">{m.context}</p>
+                    </div> -->
+                    <div class="mt-3 border-t pt-3">
+                        <div class="text-sm font-semibold opacity-80">Explanation</div>
+                        <p class="whitespace-pre-wrap">{m.context}</p>
+                        
+                        {#if m.images && m.images.length > 0}
+                            <div class="mt-4">
+                            <div class="text-sm font-semibold opacity-80">Related images</div>
+                        
+                            <div class="mt-2 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                                {#each m.images as img (img.pageUrl + '|' + img.imageUrl)}
+                                    <div class="rounded border overflow-hidden">
+                                        <a
+                                            href={img.pageUrl}
+                                            target="_blank"
+                                            rel="noreferrer"
+                                            class="block"
+                                            title="Open source page (Wikimedia Commons)"
+                                        >
+                                            <img
+                                                src={img.imageUrl}
+                                                alt={img.title ?? 'Related image'}
+                                                class="w-full h-48 object-cover"
+                                                loading="lazy"
+                                            />
+                                        </a>
+                            
+                                        <div class="p-2 text-xs opacity-80 space-y-1">
+                                            <div class="font-semibold truncate">{img.title}</div>
+                                
+                                            {#if img.attribution}
+                                                <div class="opacity-90 whitespace-pre-wrap break-words">
+                                                    {img.attribution}
+                                                </div>
+                                            {/if}
+                                
+                                            <div class="opacity-70">
+                                                {#if formatImageCredit(img)}
+                                                    <div class="opacity-70">
+                                                        {formatImageCredit(img)}
+                                                    </div>
+                                                {/if}
+                                            </div>
+                                
+                                            <div class="flex flex-wrap gap-2 pt-1">
+                                                <a
+                                                href={img.pageUrl}
+                                                target="_blank"
+                                                rel="noreferrer"
+                                                class="underline opacity-80 hover:opacity-100"
+                                                >
+                                                Source
+                                                </a>
+                                
+                                                {#if img.licenseUrl}
+                                                <a
+                                                    href={img.licenseUrl}
+                                                    target="_blank"
+                                                    rel="noreferrer"
+                                                    class="underline opacity-80 hover:opacity-100"
+                                                >
+                                                    License
+                                                </a>
+                                                {/if}
+                                            </div>
+                                        </div>
+                                    </div>
+                                {/each}
+                            </div>
+                        
+                            <div class="mt-2 text-[11px] opacity-60">
+                                Images are pulled from Wikimedia Commons and may have different licenses. Use the Source/License links for details.
+                            </div>
+                            </div>
+                        {/if}
+                    </div>
+                </div>
+            {/each}
+        </div>
+    {/if}
+
+    {#if processingVideo}
+        <div class="mt-6">
+            <Loading />
+            <div class="mt-2">
+            <span>Processing video...</span>
+            </div>
+        </div>
+    {:else if processingVideoError}
+        <div class="mt-6 text-red-700">
+            Failed processing video: {processingVideoError}
+        </div>
+    {/if}
+
+    {#if processedVideoUrl}
+        <div class="mt-6">
+            <div class="text-sm font-semibold opacity-80 mb-2">Processed output</div>
+            <video
+                class="w-full max-w-2xl rounded border"
+                src={processedVideoUrl}
+                controls
+                playsinline
+            />
+        </div>
+    {/if}
+
+
+    <!-- {#if generatingLogicalChunks}
         <div>
             <Loading />
             <div>
@@ -419,6 +1318,6 @@
                 </div>
             {/each}
         </div>
-    {/if}
+    {/if} -->
 
 </div>

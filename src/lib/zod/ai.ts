@@ -52,3 +52,11 @@ export const GenerateImageInputSchema = z.object({
   prompt: z.string().min(1),
   type: z.enum(['TECHNICAL', 'NARRATIVE', 'ARTISTIC']).optional().default('NARRATIVE')
 });
+
+export const GenerateTextContextInputSchema = z.object({
+  text: z.string().min(20),
+  // Optional: if you already have transcript segments w/ timestamps,
+  // you should pass those instead of raw text.
+  // segments: z.array(z.object({ text: z.string(), start: z.number(), end: z.number() })).optional(),
+  maxMomentsPerWindow: z.number().int().min(1).max(12).nullable().optional()
+});
